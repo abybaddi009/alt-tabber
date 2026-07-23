@@ -292,7 +292,7 @@ class _ItemWidget(QFrame):
             btn.setText("×")
         btn.setStyleSheet(
             "QToolButton{border:none;}"
-            "QToolButton:hover{background:rgba(220,38,38,180);"
+            "QToolButton:hover{background:rgba(248,113,113,200);"
             "border-radius:%dpx;}" % (diameter // 2)
         )
         btn.clicked.connect(self.close_clicked.emit)
