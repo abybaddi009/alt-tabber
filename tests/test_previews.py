@@ -2,7 +2,7 @@
 
 Previously ``show_palette`` captured every window's screenshot inline before
 ``show()``, so open latency scaled with window count (and stalled entirely
-when a capture hung). ``_PreviewLoader`` now captures on a worker thread and
+when a capture hung). ``PreviewLoader`` now captures on a worker thread and
 streams results back; the overview grid picks them up as they arrive.
 """
 
@@ -13,7 +13,8 @@ import time
 from PySide6.QtCore import QBuffer, QIODevice
 from PySide6.QtGui import QColor, QImage, QPixmap
 
-from alttabber.core.palette import _OverviewGrid, _PreviewLoader
+from alttabber.core.palette import _OverviewGrid
+from alttabber.core.previews import PreviewLoader
 from alttabber.core.switcher import _WindowEntry
 
 
@@ -50,7 +51,7 @@ def _pump_until(qapp, cond, timeout: float = 3.0) -> bool:
 
 def test_start_returns_immediately_and_streams_results(qapp):
     provider = _SlowProvider(delay=0.1)
-    loader = _PreviewLoader()
+    loader = PreviewLoader()
     got: list[tuple[int, int]] = []
     loader.preview_ready.connect(lambda gen, wid, data: got.append((gen, wid)))
 
@@ -64,7 +65,7 @@ def test_start_returns_immediately_and_streams_results(qapp):
 
 def test_cancel_stops_worker_before_remaining_windows(qapp):
     provider = _SlowProvider(delay=0.1)
-    loader = _PreviewLoader()
+    loader = PreviewLoader()
     got: list[int] = []
     loader.preview_ready.connect(lambda gen, wid, data: got.append(wid))
 

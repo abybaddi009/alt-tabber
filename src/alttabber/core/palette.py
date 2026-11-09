@@ -31,9 +31,8 @@ from __future__ import annotations
 
 import math
 import sys
-import threading
 
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QFontMetrics, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -50,6 +49,7 @@ from ..backends.base import AppProvider, WindowProvider
 from .config import Config
 from .matcher import Result, match
 from .mru import MRUTracker, WindowMRUTracker
+from .previews import PreviewLoader
 from .screens import target_screen
 from .sources import load_sources
 from .switcher import _FlowContainer, _ItemWidget, _WindowEntry
@@ -350,55 +350,6 @@ class _OverviewGrid(QWidget):
 # ---------------------------------------------------------------------------
 
 
-class _PreviewLoader(QObject):
-    """Captures window previews off the GUI thread, one window at a time.
-
-    ``capture_preview`` blocks (up to the backend's per-window timeout), so
-    running it inline before show made palette latency scale with the
-    number of open windows. Each :meth:`start` bumps a generation counter;
-    a running worker stops at its next window once superseded, and results
-    from a stale generation are dropped on arrival.
-    """
-
-    # (generation, window_id, encoded image bytes). Emitted from the worker
-    # thread; Qt queues delivery onto this object's (GUI) thread.
-    preview_ready = Signal(int, int, object)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._generation = 0
-
-    @property
-    def generation(self) -> int:
-        return self._generation
-
-    def start(self, provider: WindowProvider, window_ids: list[int]) -> int:
-        self._generation += 1
-        gen = self._generation
-        if window_ids:
-            threading.Thread(
-                target=self._run,
-                args=(provider, list(window_ids), gen),
-                name="palette-previews",
-                daemon=True,
-            ).start()
-        return gen
-
-    def cancel(self) -> None:
-        self._generation += 1
-
-    def _run(self, provider: WindowProvider, window_ids: list[int], gen: int) -> None:
-        for wid in window_ids:
-            if gen != self._generation:
-                return
-            try:
-                data = provider.capture_preview(wid)
-            except Exception:
-                data = None
-            if data and gen == self._generation:
-                self.preview_ready.emit(gen, wid, bytes(data))
-
-
 class PaletteWindow(QWidget):
     activate_window = Signal(int)  # window_id
     launch_app = Signal(str)        # bundle_path
@@ -414,7 +365,7 @@ class PaletteWindow(QWidget):
         self._wmru: WindowMRUTracker | None = None
         self._sources: list = load_sources()
         self._tile_previews_cache: dict[int, QPixmap] = {}
-        self._preview_loader = _PreviewLoader()
+        self._preview_loader = PreviewLoader()
         self._preview_loader.preview_ready.connect(self._on_preview_ready)
         # Previews arrive one window at a time; coalesce them so a burst of
         # arrivals costs one grid relayout rather than one per window.
@@ -722,8 +673,10 @@ class PaletteWindow(QWidget):
         ]
         self._preview_loader.start(self._window_provider, ids)
 
-    def _on_preview_ready(self, gen: int, window_id: int, data: bytes) -> None:
+    def _on_preview_ready(self, gen: int, window_id: int, data: bytes | None) -> None:
         if gen != self._preview_loader.generation or not self.isVisible():
+            return
+        if not data:
             return
         pix = QPixmap()
         pix.loadFromData(data)

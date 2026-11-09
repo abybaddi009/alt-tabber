@@ -12,7 +12,7 @@ import sys
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QObject, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QObject, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
@@ -29,6 +29,7 @@ from .activation import activate_window_reliably
 from .config import Config
 from .mru import MRUTracker, WindowMRUTracker
 from .paths import close_icon_path
+from .previews import PreviewLoader
 from .screens import target_screen
 from .theme import ui_scale
 
@@ -532,7 +533,7 @@ class SwitcherOverlay(QWidget):
     ) -> None:
         self._mode = "apps"
         self._entries = entries
-        self._tile_previews = tile_previews or {}
+        self._tile_previews = tile_previews if tile_previews is not None else {}
         self._rebuild()
         self._select(min(select_index, max(0, len(entries) - 1)))
 
@@ -544,7 +545,7 @@ class SwitcherOverlay(QWidget):
     ) -> None:
         self._mode = "windows"
         self._entries = entries
-        self._tile_previews = tile_previews or {}
+        self._tile_previews = tile_previews if tile_previews is not None else {}
         self._rebuild()
         self._select(min(select_index, max(0, len(entries) - 1)))
 
@@ -589,6 +590,14 @@ class SwitcherOverlay(QWidget):
         # changed; without it the flow container would fall back to its
         # default (very wide) bound and lay out a single row.
         self._container.set_max_content_width(self._max_content_width)
+
+    def update_tile_previews(self, tile_previews: dict[int, QPixmap]) -> None:
+        """Re-render tiles with previews that arrived after show."""
+        self._tile_previews = tile_previews
+        if not self._entries:
+            return
+        self._rebuild()
+        self._select(min(self._index, len(self._entries) - 1))
 
     def _select(self, index: int) -> None:
         self._index = index
@@ -644,6 +653,14 @@ class SwitcherOverlay(QWidget):
         if not enabled:
             self._preview_label.hide()
             self._preview_label.clear()
+
+    def set_preview_loading(self) -> None:
+        """Blank the large preview while the selection's capture is in flight."""
+        if not self._previews_enabled:
+            return
+        self._preview_label.setPixmap(QPixmap())
+        self._preview_label.setText("")
+        self._preview_label.show()
 
     def set_preview(self, pixmap: QPixmap | None) -> None:
         if not self._previews_enabled:
@@ -782,6 +799,21 @@ class SwitcherController(QObject):
         self.overlay.activate_window.connect(self._on_activate_window)
         self.overlay.close_window.connect(self._on_close_window)
         self.overlay.selection_changed.connect(self._update_preview)
+        # Previews are captured off the GUI thread so neither showing the
+        # overlay nor pressing Tab waits on a screenshot. Tile previews
+        # (window_previews theme) stream in after show; the single large
+        # preview (default theme) is fetched per selection and cached for
+        # the rest of the switcher session.
+        self._tile_loader = PreviewLoader()
+        self._tile_loader.preview_ready.connect(self._on_tile_preview)
+        self._tile_previews: dict[int, QPixmap] = {}
+        self._tile_flush_timer = QTimer(self)
+        self._tile_flush_timer.setSingleShot(True)
+        self._tile_flush_timer.setInterval(30)
+        self._tile_flush_timer.timeout.connect(self._flush_tile_previews)
+        self._selection_loader = PreviewLoader()
+        self._selection_loader.preview_ready.connect(self._on_selection_preview)
+        self._selection_previews: dict[int, QPixmap | None] = {}
 
     # ---- build entries ----
 
@@ -926,15 +958,15 @@ class SwitcherController(QObject):
         else:
             select_index = 0
 
-        tile_previews = (
-            self._capture_tile_previews(entries)
-            if show_previews and theme == "window_previews"
-            else {}
-        )
-        setter(entries, select_index=select_index, tile_previews=tile_previews)
+        self._stop_previews()
+        self._tile_previews = {}
+        self._selection_previews = {}
+        setter(entries, select_index=select_index, tile_previews=self._tile_previews)
 
         self._update_preview()
         self.overlay.show_overlay()
+        if show_previews and theme == "window_previews":
+            self._start_tile_previews(entries, select_index)
 
     def on_cycle(self, reverse: bool) -> None:
         self.overlay.cycle(reverse)
@@ -951,24 +983,50 @@ class SwitcherController(QObject):
                 self._mru.touch(entry.bundle_id)
             if self._wmru is not None:
                 self._wmru.touch(entry.window_id)
+        self._stop_previews()
         self.overlay.commit()
 
     def on_cancel(self) -> None:
+        self._stop_previews()
         self.overlay.hide()
 
-    def _capture_tile_previews(self, entries: list) -> dict[int, QPixmap]:
-        out: dict[int, QPixmap] = {}
-        for e in entries:
+    # ---- previews ----
+
+    def _stop_previews(self) -> None:
+        self._tile_loader.cancel()
+        self._selection_loader.cancel()
+        self._tile_flush_timer.stop()
+
+    def _start_tile_previews(self, entries: list, select_index: int) -> None:
+        """Capture tile previews in the background, selected tile first."""
+        ids: list[int] = []
+        order = entries[select_index:select_index + 1] + entries
+        for e in order:
             wid = getattr(e, "window_id", None)
-            if wid is None or wid in out:
+            if wid is None or wid <= 0 or wid in ids:
                 continue
-            data = self._wp.capture_preview(wid)
-            if not data:
-                continue
-            pix = QPixmap()
-            pix.loadFromData(data, "PNG")
-            out[wid] = pix
-        return out
+            ids.append(wid)
+        self._tile_loader.start(self._wp, ids)
+
+    def _on_tile_preview(self, gen: int, window_id: int, data: bytes | None) -> None:
+        if gen != self._tile_loader.generation or not data:
+            return
+        if not self.overlay.isVisible():
+            # Dismissed without going through on_commit/on_cancel (e.g. a
+            # tile click): stop capturing for an overlay nobody sees.
+            self._tile_loader.cancel()
+            return
+        pix = QPixmap()
+        pix.loadFromData(data)
+        if pix.isNull():
+            return
+        self._tile_previews[window_id] = pix
+        if not self._tile_flush_timer.isActive():
+            self._tile_flush_timer.start()
+
+    def _flush_tile_previews(self) -> None:
+        if self.overlay.isVisible():
+            self.overlay.update_tile_previews(self._tile_previews)
 
     def _update_preview(self) -> None:
         if not (self.config and self.config.switcher.show_previews):
@@ -980,13 +1038,29 @@ class SwitcherController(QObject):
         if window_id is None:
             self.overlay.set_preview(None)
             return
-        data = self._wp.capture_preview(window_id)
-        if not data:
-            self.overlay.set_preview(None)
+        if window_id in self._selection_previews:
+            self.overlay.set_preview(self._selection_previews[window_id])
             return
-        pix = QPixmap()
-        pix.loadFromData(data, "PNG")
-        self.overlay.set_preview(pix)
+        self.overlay.set_preview_loading()
+        self._selection_loader.start(self._wp, [window_id])
+
+    def _on_selection_preview(
+        self, gen: int, window_id: int, data: bytes | None
+    ) -> None:
+        if gen != self._selection_loader.generation:
+            return
+        pix: QPixmap | None = None
+        if data:
+            pix = QPixmap()
+            pix.loadFromData(data)
+            if pix.isNull():
+                pix = None
+        self._selection_previews[window_id] = pix
+        if not self.overlay.isVisible():
+            return
+        entry = self.overlay.current_entry()
+        if getattr(entry, "window_id", None) == window_id:
+            self.overlay.set_preview(pix)
 
     # ---- activation ----
 
