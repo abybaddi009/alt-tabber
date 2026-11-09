@@ -516,12 +516,21 @@ class MacWindowProvider(WindowProvider):
         # e.g. a minimized window); there's no compositor surface to grab.
         if window_id <= 0:
             return None
-        if _sck_available():
-            # No CG fallback on SCK failure: CGWindowListCreateImage can block
-            # ~30 s when capture is not permitted, which is worse than no
-            # thumbnail. The legacy path is only for macOS < 14 / no SCK.
-            return self._capture_preview_sck(window_id)
-        return self._capture_preview_cg(window_id)
+        # Callers may run this on a worker thread (the palette captures in
+        # the background), which has no autorelease pool of its own: without
+        # one, every autoreleased CGImage/NSBitmapImageRep/NSData leaks.
+        try:
+            from objc import autorelease_pool  # type: ignore
+        except ImportError:
+            return None
+        with autorelease_pool():
+            if _sck_available():
+                # No CG fallback on SCK failure: CGWindowListCreateImage can
+                # block ~30 s when capture is not permitted, which is worse
+                # than no thumbnail. The legacy path is only for macOS < 14 /
+                # no SCK.
+                return self._capture_preview_sck(window_id)
+            return self._capture_preview_cg(window_id)
 
     # -- ScreenCaptureKit path (macOS 14+) ---------------------------------
 

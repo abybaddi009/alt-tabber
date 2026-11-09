@@ -31,8 +31,9 @@ from __future__ import annotations
 
 import math
 import sys
+import threading
 
-from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QFontMetrics, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -236,8 +237,20 @@ class _OverviewGrid(QWidget):
         entries: list[_WindowEntry],
         previews: dict[int, QPixmap] | None = None,
     ) -> None:
-        previews = previews or {}
+        # ``is None``, not ``or``: an empty dict is falsy, and swapping the
+        # caller's (still-filling) preview cache for a fresh {} would hide
+        # previews that arrive after the grid was populated.
         self._entries = list(entries)
+        self._previews = previews if previews is not None else {}
+        self._relayout()
+
+    def set_previews(self, previews: dict[int, QPixmap]) -> None:
+        """Swap in an updated preview map and refresh affected tiles.
+
+        Tiles whose pixmap didn't change are reused (see the signature
+        check in ``_rebuild_tiles``), so only newly-arrived previews cost a
+        tile rebuild.
+        """
         self._previews = previews
         self._relayout()
 
@@ -337,6 +350,55 @@ class _OverviewGrid(QWidget):
 # ---------------------------------------------------------------------------
 
 
+class _PreviewLoader(QObject):
+    """Captures window previews off the GUI thread, one window at a time.
+
+    ``capture_preview`` blocks (up to the backend's per-window timeout), so
+    running it inline before show made palette latency scale with the
+    number of open windows. Each :meth:`start` bumps a generation counter;
+    a running worker stops at its next window once superseded, and results
+    from a stale generation are dropped on arrival.
+    """
+
+    # (generation, window_id, encoded image bytes). Emitted from the worker
+    # thread; Qt queues delivery onto this object's (GUI) thread.
+    preview_ready = Signal(int, int, object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def start(self, provider: WindowProvider, window_ids: list[int]) -> int:
+        self._generation += 1
+        gen = self._generation
+        if window_ids:
+            threading.Thread(
+                target=self._run,
+                args=(provider, list(window_ids), gen),
+                name="palette-previews",
+                daemon=True,
+            ).start()
+        return gen
+
+    def cancel(self) -> None:
+        self._generation += 1
+
+    def _run(self, provider: WindowProvider, window_ids: list[int], gen: int) -> None:
+        for wid in window_ids:
+            if gen != self._generation:
+                return
+            try:
+                data = provider.capture_preview(wid)
+            except Exception:
+                data = None
+            if data and gen == self._generation:
+                self.preview_ready.emit(gen, wid, bytes(data))
+
+
 class PaletteWindow(QWidget):
     activate_window = Signal(int)  # window_id
     launch_app = Signal(str)        # bundle_path
@@ -352,6 +414,14 @@ class PaletteWindow(QWidget):
         self._wmru: WindowMRUTracker | None = None
         self._sources: list = load_sources()
         self._tile_previews_cache: dict[int, QPixmap] = {}
+        self._preview_loader = _PreviewLoader()
+        self._preview_loader.preview_ready.connect(self._on_preview_ready)
+        # Previews arrive one window at a time; coalesce them so a burst of
+        # arrivals costs one grid relayout rather than one per window.
+        self._preview_flush_timer = QTimer(self)
+        self._preview_flush_timer.setSingleShot(True)
+        self._preview_flush_timer.setInterval(30)
+        self._preview_flush_timer.timeout.connect(self._flush_previews)
         self._all_windows: list = []  # WindowInfo list for overview filtering
         self._scale: float = ui_scale(config.ui_size)
         self._icon_cache: dict[str, QIcon] = {}
@@ -525,7 +595,10 @@ class PaletteWindow(QWidget):
         # the new scale applies the next time the palette opens.
         self._apply_size_scale()
         self._field.clear()
-        self._capture_overview_previews()
+        # Drop last session's previews; tiles show app icons until this
+        # session's captures stream in (started after show(), below).
+        self._preview_loader.cancel()
+        self._tile_previews_cache = {}
         self._refresh_timer.stop()
         self._refresh("")
         current = self.screen() if hasattr(self, "screen") else None
@@ -563,9 +636,12 @@ class PaletteWindow(QWidget):
             from ..platform.macos.overlay import raise_to_overlay_level
 
             raise_to_overlay_level(self)
+        self._start_preview_capture()
 
     def hide_palette(self) -> None:
         self._refresh_timer.stop()
+        self._preview_loader.cancel()
+        self._preview_flush_timer.stop()
         self.hide()
 
     # ---- events ----
@@ -627,25 +703,39 @@ class PaletteWindow(QWidget):
 
     # ---- preview capture ----
 
-    def _capture_overview_previews(self) -> None:
-        """Grab a screenshot for every open window once per palette show.
+    def _start_preview_capture(self) -> None:
+        """Kick off background capture of every open window's preview.
 
-        Previews are cached for the lifetime of a single palette session
-        (show -> hide); they are recaptured on the next show.
+        Uses the window list ``_refresh`` already fetched (MRU-ordered, so
+        the most relevant tiles fill in first) instead of enumerating
+        windows a second time. Previews live for one palette session
+        (show -> hide) and are recaptured on the next show.
         """
-        self._tile_previews_cache = {}
         if self._window_provider is None:
             return
         if not self.config.palette.overview_enabled:
             return
-        for w in self._window_provider.list_windows():
-            data = self._window_provider.capture_preview(w.window_id)
-            if not data:
-                continue
-            pix = QPixmap()
-            pix.loadFromData(data, "PNG")
-            if not pix.isNull():
-                self._tile_previews_cache[w.window_id] = pix
+        ids = [
+            w.window_id
+            for w in self._all_windows
+            if not w.is_minimized and w.window_id > 0
+        ]
+        self._preview_loader.start(self._window_provider, ids)
+
+    def _on_preview_ready(self, gen: int, window_id: int, data: bytes) -> None:
+        if gen != self._preview_loader.generation or not self.isVisible():
+            return
+        pix = QPixmap()
+        pix.loadFromData(data)
+        if pix.isNull():
+            return
+        self._tile_previews_cache[window_id] = pix
+        if not self._preview_flush_timer.isActive():
+            self._preview_flush_timer.start()
+
+    def _flush_previews(self) -> None:
+        if self.isVisible() and self.config.palette.overview_enabled:
+            self._overview.set_previews(self._tile_previews_cache)
 
     def _order_windows_mru(self, windows: list) -> list:
         """Return ``windows`` ordered by per-window MRU (most recent first).
