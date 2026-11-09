@@ -22,14 +22,32 @@ class Result:
     bundle_path: str | None = None
 
 
-def _window_text(w: WindowInfo) -> str:
-    if w.window_title and w.window_title != w.app_name:
-        return f"{w.app_name} {w.window_title}"
-    return w.app_name
-
-
 def _app_text(a: AppInfo) -> str:
     return a.name
+
+
+# Floor applied when the query appears verbatim in a field. WRatio scales
+# partial matches down by length ratio (to 0.6x once the text is ~8x the
+# query), so "teams" scores only 60 against "Microsoft Teams Chat | WSD
+# Tickets discussion" -- below unrelated fuzzy hits like "Stremio" (72).
+# A literal substring hit is a stronger signal than any fuzzy-only match.
+_SUBSTRING_FLOOR = 90.0
+
+
+def _score(q: str, fields: list[str]) -> float:
+    """Best relevance of ``q`` across ``fields`` (already lower-cased).
+
+    Each field is scored on its own as well as combined, so a long window
+    title doesn't dilute a strong match on the app name (and vice versa).
+    """
+    fields = [f for f in fields if f]
+    if not fields:
+        return 0.0
+    candidates = fields + ([" ".join(fields)] if len(fields) > 1 else [])
+    best = max(fuzz.WRatio(q, f) for f in candidates)
+    if any(q in f for f in fields):
+        best = max(best, _SUBSTRING_FLOOR)
+    return best
 
 
 def match(
@@ -47,8 +65,10 @@ def match(
     app_results: list[Result] = []
 
     for w in windows:
-        text = _window_text(w)
-        score = fuzz.WRatio(q, text.lower()) if q else 0.0
+        fields = [w.app_name.lower()]
+        if w.window_title and w.window_title != w.app_name:
+            fields.append(w.window_title.lower())
+        score = _score(q, fields) if q else 0.0
         if q and score < 30:
             continue
         win_results.append(
@@ -67,8 +87,7 @@ def match(
         # Exclude apps that already have an open window.
         if a.bundle_id and a.bundle_id in open_bundle_ids:
             continue
-        text = _app_text(a)
-        score = fuzz.WRatio(q, text.lower()) if q else 0.0
+        score = _score(q, [_app_text(a).lower()]) if q else 0.0
         if q and score < 30:
             continue
         app_results.append(
