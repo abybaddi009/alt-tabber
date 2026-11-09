@@ -8,6 +8,41 @@ from __future__ import annotations
 
 from ...backends.base import WindowInfo, WindowProvider
 
+# ScreenCaptureKit thumbnail capture tunables.
+_SCK_CAPTURE_TIMEOUT_S = 0.3  # hard per-window cap on a synchronous capture
+_SCK_CONTENT_TIMEOUT_S = 1.0  # cap on the shareable-content lookup
+_SCK_CACHE_TTL_S = 1.0  # how long SCWindow objects are reused
+_PREVIEW_LONG_EDGE_PX = 480
+_SCK_SUSPEND_S = 5.0  # back-off after a timeout (see _capture_preview_sck)
+_SCK_STATE: dict = {"suspend_until": 0.0, "last_error": None, "checked": None}
+
+
+def _describe_error(err) -> str | None:
+    if err is None:
+        return None
+    try:
+        return f"{err.domain()} code={err.code()}: {err.localizedDescription()}"
+    except Exception:
+        return repr(err)
+
+
+def _sck_available() -> bool:
+    """True when ScreenCaptureKit screenshots can be used (macOS 14+)."""
+    if _SCK_STATE["checked"] is None:
+        ok = False
+        try:
+            import platform
+
+            if int(platform.mac_ver()[0].split(".")[0] or 0) >= 14:
+                import ScreenCaptureKit as SCK  # type: ignore
+
+                ok = hasattr(SCK, "SCScreenshotManager")
+        except Exception:
+            ok = False
+        _SCK_STATE["checked"] = ok
+    return bool(_SCK_STATE["checked"])
+
+
 # Private CGWindowID <-> AXUIElement bridge. AX only exposes windows by
 # title/children order, which is ambiguous when two windows of the same app
 # share a title (or both have none) -- _AXUIElementGetWindow gives us the
@@ -481,13 +516,113 @@ class MacWindowProvider(WindowProvider):
         # e.g. a minimized window); there's no compositor surface to grab.
         if window_id <= 0:
             return None
+        if _sck_available():
+            # No CG fallback on SCK failure: CGWindowListCreateImage can block
+            # ~30 s when capture is not permitted, which is worse than no
+            # thumbnail. The legacy path is only for macOS < 14 / no SCK.
+            return self._capture_preview_sck(window_id)
+        return self._capture_preview_cg(window_id)
+
+    # -- ScreenCaptureKit path (macOS 14+) ---------------------------------
+
+    def _sck_windows(self) -> dict | None:
+        """SCWindow objects keyed by windowID, cached for _SCK_CACHE_TTL_S."""
+        import threading
+        import time
+
+        now = time.monotonic()
+        cache = self.__dict__.get("_sck_cache")
+        if cache is not None and now - cache[0] < _SCK_CACHE_TTL_S:
+            return cache[1]
+        import ScreenCaptureKit as SCK  # type: ignore
+
+        done = threading.Event()
+        box: dict = {}
+
+        def handler(content, error):
+            box["content"] = content
+            box["error"] = error
+            done.set()
+
+        SCK.SCShareableContent.getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
+            False, False, handler
+        )
+        if not done.wait(_SCK_CONTENT_TIMEOUT_S) or box.get("content") is None:
+            _SCK_STATE["last_error"] = _describe_error(box.get("error")) or "timeout"
+            return None
+        windows = {int(w.windowID()): w for w in box["content"].windows()}
+        self._sck_cache = (now, windows)
+        return windows
+
+    def _capture_preview_sck(self, window_id: int) -> bytes | None:
+        import threading
+        import time
+
+        # Circuit breaker: after a timeout, skip SCK briefly so a show with
+        # many windows costs one timeout, not one per window.
+        if time.monotonic() < _SCK_STATE["suspend_until"]:
+            return None
+        try:
+            import ScreenCaptureKit as SCK  # type: ignore
+            from AppKit import (  # type: ignore
+                NSBitmapImageRep,
+                NSBitmapImageFileTypePNG,
+            )
+
+            windows = self._sck_windows()
+            if windows is None:
+                _SCK_STATE["suspend_until"] = time.monotonic() + _SCK_SUSPEND_S
+                return None
+            scwin = windows.get(window_id)
+            if scwin is None:
+                return None
+            frame = scwin.frame()
+            w, h = float(frame.size.width), float(frame.size.height)
+            if w < 1 or h < 1:
+                return None
+            scale = _PREVIEW_LONG_EDGE_PX / max(w, h)
+            cfg = SCK.SCStreamConfiguration.alloc().init()
+            cfg.setWidth_(max(1, int(round(w * scale))))
+            cfg.setHeight_(max(1, int(round(h * scale))))
+            cfg.setShowsCursor_(False)
+            flt = SCK.SCContentFilter.alloc().initWithDesktopIndependentWindow_(scwin)
+
+            done = threading.Event()
+            box: dict = {}
+
+            def handler(image, error):
+                box["image"] = image
+                box["error"] = error
+                done.set()
+
+            SCK.SCScreenshotManager.captureImageWithFilter_configuration_completionHandler_(
+                flt, cfg, handler
+            )
+            if not done.wait(_SCK_CAPTURE_TIMEOUT_S):
+                _SCK_STATE["last_error"] = "capture timeout"
+                _SCK_STATE["suspend_until"] = time.monotonic() + _SCK_SUSPEND_S
+                return None
+            image = box.get("image")
+            if image is None:
+                _SCK_STATE["last_error"] = _describe_error(box.get("error"))
+                return None
+            rep = NSBitmapImageRep.alloc().initWithCGImage_(image)
+            data = rep.representationUsingType_properties_(NSBitmapImageFileTypePNG, None)
+            return bytes(data) if data is not None else None
+        except Exception as exc:
+            _SCK_STATE["last_error"] = repr(exc)
+            return None
+
+    # -- Legacy CoreGraphics path (macOS < 14 or SCK unavailable) ----------
+
+    def _capture_preview_cg(self, window_id: int) -> bytes | None:
         try:
             from Quartz import (  # type: ignore
                 CGWindowListCreateImage,
                 CGRectNull,
                 kCGWindowListOptionIncludingWindow,
                 kCGWindowImageBoundsIgnoreFraming,
-                kCGWindowImageBestResolution,
+                kCGWindowImageNominalResolution,
             )
             from AppKit import (  # type: ignore
                 NSBitmapImageRep,
@@ -500,7 +635,7 @@ class MacWindowProvider(WindowProvider):
                 CGRectNull,
                 kCGWindowListOptionIncludingWindow,
                 window_id,
-                kCGWindowImageBoundsIgnoreFraming | kCGWindowImageBestResolution,
+                kCGWindowImageBoundsIgnoreFraming | kCGWindowImageNominalResolution,
             )
             if image is None:
                 return None

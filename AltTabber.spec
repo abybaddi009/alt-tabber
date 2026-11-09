@@ -10,7 +10,7 @@ a = Analysis(
         ('src/alttabber/assets/default.png', 'alttabber/assets'),
         ('src/alttabber/assets/thumbnails.png', 'alttabber/assets'),
     ],
-    hiddenimports=[],
+    hiddenimports=['ScreenCaptureKit'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
