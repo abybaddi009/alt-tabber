@@ -565,6 +565,13 @@ class SettingsDialog(QDialog):
         self._launch_at_login.setChecked(self._launch_at_login_init)
         general.add_row("Launch Alt-Tabber at login", self._launch_at_login)
 
+        self._monitor_focus = QCheckBox()
+        self._monitor_focus.setChecked(config.monitor_focus)
+        general.add_row(
+            "Track external window focus (keep switcher order current)",
+            self._monitor_focus,
+        )
+
         self._screen_preference = QComboBox()
         for value, label in _SCREEN_PREFERENCES:
             self._screen_preference.addItem(label, value)
@@ -815,6 +822,7 @@ class SettingsDialog(QDialog):
             for ln in self._excluded_titles.toPlainText().splitlines()
             if ln.strip()
         ]
+        cfg.monitor_focus = self._monitor_focus.isChecked()
         try:
             save_config(cfg)
         except Exception as exc:  # pragma: no cover - filesystem error

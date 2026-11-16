@@ -313,6 +313,71 @@ class MacWindowProvider(WindowProvider):
         except Exception:
             return None
 
+    def _frontmost_focused_ax_ref(self):
+        """Return the AXUIElement for the frontmost app's focused window.
+
+        Shared by :meth:`frontmost_window_center` (reads position/size
+        from it) and :meth:`frontmost_window_id` (resolves it to a real
+        CGWindowID via the private ``_AXUIElementGetWindow`` bridge).
+        Returns ``(win_ref, app_name, pid)`` or ``None`` when the
+        frontmost app or its focused window can't be resolved.
+        """
+        import os
+        import sys
+
+        debug = os.environ.get("ALTTABBER_DEBUG_SCREEN") == "1"
+
+        def dbg(msg: str) -> None:
+            if debug:
+                print(f"[alttabber windows] {msg}", file=sys.stderr)
+
+        try:
+            from ApplicationServices import (  # type: ignore
+                AXUIElementCreateApplication,
+                AXUIElementCopyAttributeValue,
+                kAXFocusedWindowAttribute,
+            )
+            from Cocoa import NSWorkspace  # type: ignore
+        except ImportError:
+            dbg("frontmost focused window: Cocoa/ApplicationServices import failed")
+            return None
+        try:
+            front = NSWorkspace.sharedWorkspace().frontmostApplication()
+            if front is None:
+                dbg("frontmost focused window: no frontmost application")
+                return None
+            name = str(front.localizedName()) if front.localizedName() else "?"
+            pid = int(front.processIdentifier())
+            app_el = AXUIElementCreateApplication(pid)
+            err, win = AXUIElementCopyAttributeValue(
+                app_el, kAXFocusedWindowAttribute, None
+            )
+            if err != 0 or win is None:
+                dbg(f"frontmost focused window: {name} (pid {pid}) no focused window (err={err})")
+                return None
+            return win, name, pid
+        except Exception as e:
+            dbg(f"frontmost focused window: exception {e!r}")
+            return None
+
+    def frontmost_window_id(self) -> int | None:
+        """Return the CGWindowID of the frontmost app's focused window.
+
+        Resolves the focused window's AXUIElement to its real CGWindowID
+        via ``_AXUIElementGetWindow`` (the same private bridge
+        :meth:`activate_window` relies on), so the focus monitor can
+        record external activations in :class:`WindowMRUTracker`.
+
+        Returns None when the AX bridge can't load or the focused window
+        can't be resolved -- the focus monitor then degrades to app-level
+        MRU only.
+        """
+        resolved = self._frontmost_focused_ax_ref()
+        if resolved is None:
+            return None
+        win, _name, _pid = resolved
+        return _ax_cg_window_id(win)
+
     def frontmost_window_center(self) -> tuple[float, float] | None:
         """Center point, in global (Quartz/Qt) screen coordinates, of the
         frontmost app's focused window -- used to pick which monitor the
@@ -333,7 +398,8 @@ class MacWindowProvider(WindowProvider):
         display.
 
         Instead this reads the frontmost app's ``kAXFocusedWindowAttribute``
-        position/size directly via Accessibility. AX position/size use the
+        position/size directly via Accessibility (resolved by
+        :meth:`_frontmost_focused_ax_ref`). AX position/size use the
         same top-left/Y-down global coordinate space as CGWindowList and Qt
         (no flip needed), but are queried live from the focused app itself
         rather than reconstructed from the window server's compositing list,
@@ -354,33 +420,22 @@ class MacWindowProvider(WindowProvider):
 
         try:
             from ApplicationServices import (  # type: ignore
-                AXUIElementCreateApplication,
                 AXUIElementCopyAttributeValue,
                 AXValueGetValue,
-                kAXFocusedWindowAttribute,
                 kAXPositionAttribute,
                 kAXSizeAttribute,
                 kAXValueCGPointType,
                 kAXValueCGSizeType,
             )
-            from Cocoa import NSWorkspace  # type: ignore
         except ImportError:
-            dbg("frontmost_window_center: Cocoa/ApplicationServices import failed")
+            dbg("frontmost_window_center: ApplicationServices import failed")
             return None
+
+        resolved = self._frontmost_focused_ax_ref()
+        if resolved is None:
+            return None
+        win, name, pid = resolved
         try:
-            front = NSWorkspace.sharedWorkspace().frontmostApplication()
-            if front is None:
-                dbg("frontmost_window_center: no frontmost application")
-                return None
-            name = str(front.localizedName()) if front.localizedName() else "?"
-            pid = int(front.processIdentifier())
-            app_el = AXUIElementCreateApplication(pid)
-            err, win = AXUIElementCopyAttributeValue(
-                app_el, kAXFocusedWindowAttribute, None
-            )
-            if err != 0 or win is None:
-                dbg(f"frontmost_window_center: {name} (pid {pid}) no focused window (err={err})")
-                return None
             err, pos_ref = AXUIElementCopyAttributeValue(win, kAXPositionAttribute, None)
             if err != 0 or pos_ref is None:
                 dbg(f"frontmost_window_center: {name} (pid {pid}) no position (err={err})")

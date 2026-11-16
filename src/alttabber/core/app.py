@@ -56,6 +56,7 @@ class AltTabberApp(QObject):
         self._wmru: WindowMRUTracker | None = None
         self._app_switcher: SwitcherController | None = None
         self._window_switcher: SwitcherController | None = None
+        self._focus_monitor = None
 
     def start(self) -> int:
         # Keep a hidden reference window so the app stays resident and can
@@ -188,6 +189,52 @@ class AltTabberApp(QObject):
             self.config.hotkeys.launcher, _show_palette
         )
         self._hotkey_provider.start()
+        self._ensure_focus_monitor()
+
+    def _overlays_visible(self) -> bool:
+        """True while the palette or a switcher overlay is showing.
+
+        The focus monitor skips polling while this is True so it doesn't
+        record the palette's own activation (``show_palette`` calls
+        ``activateWindow`` on itself) or a switcher overlay's transient
+        raise as a focus change.
+        """
+        return (
+            (self._palette is not None and self._palette.isVisible())
+            or (
+                self._app_switcher is not None
+                and self._app_switcher.overlay.isVisible()
+            )
+            or (
+                self._window_switcher is not None
+                and self._window_switcher.overlay.isVisible()
+            )
+        )
+
+    def _ensure_focus_monitor(self) -> None:
+        """Start or stop the focus monitor to match ``config.monitor_focus``.
+
+        Called once at the end of :meth:`_build_palette` and again on
+        reload so a Settings toggle takes effect without a restart. The
+        monitor polls the frontmost window/app and touches the shared MRU
+        trackers so ordering reflects external activations (mouse clicks,
+        native Cmd-Tab, Dock clicks) that bypass our activation slots.
+        """
+        if self._window_provider is None or self._mru is None or self._wmru is None:
+            return
+        if self.config.monitor_focus and self._focus_monitor is None:
+            from .focus import FocusMonitor
+
+            self._focus_monitor = FocusMonitor(
+                self._window_provider,
+                self._mru,
+                self._wmru,
+                should_skip=self._overlays_visible,
+            )
+            self._focus_monitor.start()
+        elif not self.config.monitor_focus and self._focus_monitor is not None:
+            self._focus_monitor.stop()
+            self._focus_monitor = None
 
     @Slot(int)
     def _on_activate_window(self, window_id: int) -> None:
@@ -275,6 +322,7 @@ class AltTabberApp(QObject):
         ):
             self._window_provider.set_excluded_titles(self.config.excluded_window_titles)
         self.config_changed.emit()
+        self._ensure_focus_monitor()
         if self._tray is not None:
             self._tray.show_message("Alt-Tabber", "Configuration reloaded.")
 

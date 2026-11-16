@@ -50,6 +50,18 @@ class WindowProvider(ABC):
         """
         return None
 
+    def frontmost_window_id(self) -> int | None:
+        """Return the platform window id of the currently focused window.
+
+        Used by the focus monitor to detect external activations (mouse
+        clicks, native Cmd-Tab, Dock clicks) that bypass Alt-Tabber's own
+        activation slots, so MRU ordering tracks real focus recency.
+        Concrete backends should override; the default returns None so
+        callers degrade gracefully when window-level detection is
+        unavailable (e.g. the private AX bridge can't load).
+        """
+        return None
+
     def frontmost_window_center(self) -> tuple[float, float] | None:
         """Center point, in global screen coordinates, of the frontmost
         window -- used to determine which monitor is "active" on a

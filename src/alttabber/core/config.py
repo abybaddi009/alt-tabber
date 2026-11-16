@@ -73,6 +73,11 @@ class Config:
     switcher: SwitcherConfig = field(default_factory=SwitcherConfig)
     # If True, alttabber quits when the tray is removed rather than staying resident.
     quit_on_tray_close: bool = False
+    # If True, poll the frontmost window/app periodically and update MRU
+    # ordering so the switcher/palette reflect external focus changes
+    # (mouse clicks, native Cmd-Tab, Dock clicks). Paused while an overlay
+    # is visible. Disable to reduce background AX polling.
+    monitor_focus: bool = True
     # Which screen the launcher palette and switcher overlay open on: "active"
     # (the screen the window last occupied, falling back to the primary
     # screen) or "pointer" (the screen currently under the mouse cursor).
@@ -131,6 +136,8 @@ def _merge(cfg: Config, data: dict) -> Config:
 
     if "quit_on_tray_close" in data:
         cfg.quit_on_tray_close = bool(data["quit_on_tray_close"])
+    if "monitor_focus" in data:
+        cfg.monitor_focus = bool(data["monitor_focus"])
 
     if "screen_preference" in data and str(data["screen_preference"]) in SCREEN_PREFERENCES:
         cfg.screen_preference = str(data["screen_preference"])
@@ -151,6 +158,7 @@ def save_config(cfg: Config, path: Path | None = None) -> None:
         "# Alt-Tabber configuration. Edit and use Reload config from the tray.",
         "",
         f"quit_on_tray_close = {'true' if cfg.quit_on_tray_close else 'false'}",
+        f"monitor_focus = {'true' if cfg.monitor_focus else 'false'}",
         f'screen_preference = {_toml_str(cfg.screen_preference)}',
         f'ui_size = {_toml_str(cfg.ui_size)}',
         "excluded_window_titles = ["
