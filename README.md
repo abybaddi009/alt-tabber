@@ -43,7 +43,7 @@ Cross-platform by design: macOS today, Linux (Wayland-first) and Windows next.
 ## Get started
 
 ```sh
-uv run alttabber
+uv run alt-tabber
 ```
 
 On first launch, grant **Accessibility** and **Screen Recording** permission
