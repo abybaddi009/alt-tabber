@@ -12,8 +12,8 @@ import sys
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QObject, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QObject, QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -459,6 +459,20 @@ class SwitcherOverlay(QWidget):
         self._tile_previews: dict[int, QPixmap] = {}
         self._max_content_width: int = 10_000
         self._scale: float = 1.0
+        # Cursor position captured when tiles were (re)laid out under it.
+        # Qt delivers ``enterEvent`` to whichever tile renders beneath a
+        # stationary cursor (on show, and again whenever previews arrive and
+        # the tiles are rebuilt); those must not steal the keyboard
+        # selection. Hover only counts once the cursor has moved away from
+        # this point. ``None`` means hover is armed.
+        self._hover_origin: QPoint | None = None
+        # While disarmed, poll the cursor so that even a small move *within*
+        # the tile already under the pointer (which produces no new
+        # enterEvent) selects it. Polling rather than MouseMove events
+        # because this non-activating tool window may not receive them.
+        self._hover_poll = QTimer(self)
+        self._hover_poll.setInterval(30)
+        self._hover_poll.timeout.connect(self._poll_cursor)
 
         self.setWindowFlags(
             Qt.FramelessWindowHint
@@ -585,6 +599,9 @@ class SwitcherOverlay(QWidget):
             if isinstance(e, _WindowEntry):
                 tile.close_clicked.connect(lambda i=index: self._on_tile_close(i))
             tiles.append(tile)
+        # Rebuilt tiles get a fresh enterEvent under a stationary cursor;
+        # ignore it so arriving previews can't yank the selection.
+        self._disarm_hover()
         self._container.set_tiles(tiles)
         # Re-apply the screen-derived width constraint now that the tiles
         # changed; without it the flow container would fall back to its
@@ -606,8 +623,45 @@ class SwitcherOverlay(QWidget):
             if isinstance(w, _ItemWidget):
                 w.set_selected(i == index)
 
+    def _disarm_hover(self) -> None:
+        self._hover_origin = QCursor.pos()
+        self._hover_poll.start()
+
+    def _poll_cursor(self) -> None:
+        if self._hover_origin is None or not self.isVisible():
+            self._hover_poll.stop()
+            return
+        pos = QCursor.pos()
+        if pos == self._hover_origin:
+            return
+        # First real move: arm hover and select whatever is under it now.
+        self._hover_origin = None
+        self._hover_poll.stop()
+        index = self._tile_index_at(pos)
+        if index is not None:
+            self._on_tile_hovered(index)
+
+    def _tile_index_at(self, global_pos: QPoint) -> int | None:
+        for i in range(self._container.count()):
+            w = self._container.tile(i)
+            if (
+                w is not None
+                and w.isVisible()
+                and w.rect().contains(w.mapFromGlobal(global_pos))
+            ):
+                return i
+        return None
+
+    def hideEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self._hover_poll.stop()
+        super().hideEvent(event)
+
     def _on_tile_hovered(self, index: int) -> None:
         """Move the selection to the tile under the pointer (mouse hover)."""
+        if self._hover_origin is not None:
+            if QCursor.pos() == self._hover_origin:
+                return  # tile merely rendered under a stationary cursor
+            self._hover_origin = None
         if 0 <= index < len(self._entries) and index != self._index:
             self._select(index)
             self.selection_changed.emit()
@@ -744,6 +798,9 @@ class SwitcherOverlay(QWidget):
             self.move(x, y)
         else:
             self.adjustSize()
+        # Disarm hover: the tile that renders under the cursor must not take
+        # the selection until the user actually moves the mouse.
+        self._disarm_hover()
         self.show()
         self.raise_()
         # After show(): Qt has (re)set the window level from the window
