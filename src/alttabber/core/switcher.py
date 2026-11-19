@@ -809,6 +809,11 @@ class SwitcherOverlay(QWidget):
         if fullscreen:
             from ..platform.macos.overlay import raise_to_overlay_level
 
+            # When escalated (fullscreen app or secure input), really take
+            # activation the way the palette does. Without the Qt-level
+            # activateWindow() the previous app stays active, and the window
+            # activated on commit then lands *behind* it.
+            self.activateWindow()
             raise_to_overlay_level(self)
 
     def keyPressEvent(self, event):

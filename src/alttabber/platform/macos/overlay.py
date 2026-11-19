@@ -47,6 +47,23 @@ def _dbg(msg: str) -> None:
         print(f"[alttabber overlay] {msg}", file=sys.stderr)
 
 
+def secure_input_enabled() -> bool:
+    """Whether some app has Secure Event Input on (e.g. a focused password field).
+
+    While it is on, the WindowServer does not composite our ordinary Qt.Tool
+    overlay over the secure app (Qt reports it visible, nothing is drawn), so
+    the overlay needs the same panel escalation as over a fullscreen Space.
+    """
+    try:
+        import ctypes
+
+        carbon = ctypes.CDLL("/System/Library/Frameworks/Carbon.framework/Carbon")
+        carbon.IsSecureEventInputEnabled.restype = ctypes.c_bool
+        return bool(carbon.IsSecureEventInputEnabled())
+    except Exception:
+        return False
+
+
 def _frontmost_app_is_fullscreen() -> bool:
     """Whether the frontmost app's focused window is in native fullscreen.
 
@@ -124,9 +141,11 @@ def prepare_for_fullscreen(widget) -> bool:
     """
     if sys.platform != "darwin":
         return False
-    if not _frontmost_app_is_fullscreen():
-        _dbg("prepare_for_fullscreen: skipped (no fullscreen app detected)")
+    secure = secure_input_enabled()
+    if not secure and not _frontmost_app_is_fullscreen():
+        _dbg("prepare_for_fullscreen: skipped (no fullscreen app, no secure input)")
         return False
+    _dbg(f"prepare_for_fullscreen: escalating (secure_input={secure})")
     try:
         from AppKit import (  # type: ignore
             NSWindowCollectionBehaviorCanJoinAllSpaces,
